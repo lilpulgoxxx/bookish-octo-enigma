@@ -1,5 +1,5 @@
 fastapi
 uvicorn==0.22.0
 vllm==0.6.4.post1
-huggingface_hub==0.16.4
+huggingface_hub
 datetime==4.3
