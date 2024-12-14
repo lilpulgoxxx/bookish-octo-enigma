@@ -3,11 +3,10 @@ from pydantic import BaseModel
 from llama_cpp import Llama
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import asyncio
-import gradio as gr
 import os
 from dotenv import load_dotenv
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
 from threading import Thread
 import psutil
@@ -18,6 +17,8 @@ from PIL import Image
 import stable_diffusion_cpp as sdcpp
 import base64
 import io
+import time
+from typing import AsyncGenerator
 
 load_dotenv()
 HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN")
@@ -254,6 +255,7 @@ class ModelManager:
     def load_model(self, model_config):
         if model_config['name'] not in self.models and model_config['name'] != "flux1-schnell":
            try:
+               print(f"Loading model: {model_config['name']}")
                self.models[model_config['name']] = Llama.from_pretrained(
                   repo_id=model_config['repo_id'],
                   filename=model_config['filename'],
@@ -261,11 +263,20 @@ class ModelManager:
                   n_threads=20,
                   use_gpu=False
                )
+               print(f"Model loaded: {model_config['name']}")
+               # Load tokenizer after model load
+               if model_config['name'] not in global_data['tokenizers']:
+                    global_data['tokenizers'][model_config['name']] = self.models[model_config['name']].tokenizer()
+                    print(f"tokenizer loaded for: {model_config['name']}")
+                    # load the eos token
+                    global_data['eos'][model_config['name']] = self.models[model_config['name']].token_eos()
+                    print(f"eos loaded for: {model_config['name']}")
            except Exception as e:
-              pass
+               print(f"Error loading model {model_config['name']}: {e}")
 
     def load_image_model(self, model_config):
        try:
+          print(f"Attempting to load image model with config: {model_config}")
           self.image_model = sdcpp.StableDiffusionCpp(
               repo_id=model_config['repo_id'],
               filename=model_config['filename'],
@@ -273,6 +284,7 @@ class ModelManager:
               n_threads=20,
               use_gpu=False
           )
+          print(f"Image model loaded successfully: {self.image_model}")
        except Exception as e:
          print(f"Error loading image model: {e}")
 
@@ -320,9 +332,9 @@ def cache_response(func):
 
 
 @cache_response
-def generate_model_response(model, inputs):
+def generate_model_response(model, inputs, max_tokens=9999999):
     try:
-        response = model(inputs, max_tokens=9999999)
+        response = model(inputs, max_tokens=max_tokens)
         return remove_duplicates(response['choices'][0]['text'])
     except Exception as e:
         return ""
@@ -334,24 +346,68 @@ def remove_repetitive_responses(responses):
             unique_responses[response['model']] = response['response']
     return unique_responses
 
-async def process_message(message):
+
+async def process_message(message: str):
     inputs = normalize_input(message)
-    with ThreadPoolExecutor() as executor:
-        futures = [
-            executor.submit(generate_model_response, model, inputs)
-            for model in global_data['models'].values()
-        ]
-        responses = [
-            {'model': model_name, 'response': future.result()}
-            for model_name, future in zip(global_data['models'].keys(), as_completed(futures))
-        ]
-    unique_responses = remove_repetitive_responses(responses)
-    formatted_response = next(iter(unique_responses.values()))
-    return formatted_response
+    
+    async def stream_response(inputs: str) -> AsyncGenerator[str, None]:
+            max_token_limit = 150
+            full_response = ""
+            current_inputs = inputs
+            eos_found = False
+            
+            start_time = time.time()
+            
+            executor = ThreadPoolExecutor()
+            while current_inputs and not eos_found:
+                futures = [
+                    executor.submit(generate_model_response, model, current_inputs, max_tokens=max_token_limit)
+                    for model in global_data['models'].values()
+                ]
+                responses = [
+                    {'model': model_name, 'response': future.result()}
+                    for model_name, future in zip(global_data['models'].keys(), as_completed(futures))
+                ]
+                unique_responses = remove_repetitive_responses(responses)
+                formatted_response = next(iter(unique_responses.values()))
+                
+                print(f"Generated chunk: {formatted_response}")
+                
+                
+                #tokenize the response
+                tokenizer = next(iter(global_data['tokenizers'].values()))
+                tokens = tokenizer.encode(formatted_response)
+                
+                
+                token_count = len(tokens)
+                chunk_size = 30 # Set token chunk size
+                for i in range(0, token_count, chunk_size):
+                  chunk_tokens = tokens[i : i + chunk_size]
+                  decoded_chunk = tokenizer.decode(chunk_tokens)
+                  yield decoded_chunk
+                
+                # Check for EOS token in decoded chunk
+                
+                eos_token = next(iter(global_data['eos'].values()))
+                if eos_token in tokens:
+                   eos_found = True
+                   print(f"End of sequence token found")
+                   break
+                
+                full_response += formatted_response
+                current_inputs = formatted_response if len(formatted_response.split()) > 0 else ""
+            
+            end_time = time.time()
+            executor.shutdown(wait=True) # waits for all threads to finish
+            print(f"Total time taken to process response {end_time-start_time}")
+            
+    return StreamingResponse(stream_response(inputs), media_type="text/plain")
+
 
 async def generate_image(prompt: str):
     if global_data['image_model']:
         try:
+            print("Generating image with prompt:", prompt)
             image_bytes = global_data['image_model'].generate(
                 prompt=prompt,
                 negative_prompt="ugly, deformed, disfigured",
@@ -364,40 +420,76 @@ async def generate_image(prompt: str):
              )
              
             image = Image.open(io.BytesIO(image_bytes))
-            return image
+            print("Image generated successfully.")
+            
+            buffered = io.BytesIO()
+            image.save(buffered, format="PNG")
+            image_base64 = base64.b64encode(buffered.getvalue()).decode()
+
+            return JSONResponse(content={"image": image_base64})
         except Exception as e:
            print(f"Error generating image: {e}")
-           return None
+           return JSONResponse(content={"error": str(e)})
     else:
          print("No image model loaded.")
-         return None
+         return JSONResponse(content={"error": "No image model loaded"})
+
+def release_resources():
+    try:
+        torch.cuda.empty_cache()
+        gc.collect()
+    except Exception as e:
+        print(f"Failed to release resources: {e}")
+
+def resource_manager():
+    MAX_RAM_PERCENT = 10
+    MAX_CPU_PERCENT = 10
+    MAX_GPU_PERCENT = 10
+    MAX_RAM_MB = 1024 # 1GB
+
+    while True:
+        try:
+            virtual_mem = psutil.virtual_memory()
+            current_ram_percent = virtual_mem.percent
+            current_ram_mb = virtual_mem.used / (1024 * 1024)  # Convert to MB
+
+            if current_ram_percent > MAX_RAM_PERCENT or current_ram_mb > MAX_RAM_MB:
+                release_resources()
+
+            current_cpu_percent = psutil.cpu_percent()
+            if current_cpu_percent > MAX_CPU_PERCENT:
+               print("CPU usage too high, attempting to reduce nice")
+               p = psutil.Process(os.getpid())
+               p.nice(1)
+
+            if torch.cuda.is_available():
+                gpu = torch.cuda.current_device()
+                gpu_mem = torch.cuda.memory_percent(gpu)
+
+                if gpu_mem > MAX_GPU_PERCENT:
+                    release_resources()
+
+            time.sleep(10) # Check every 10 seconds
+        except Exception as e:
+            print(f"Error in resource manager: {e}")
     
 
 app = FastAPI()
 
 @app.post("/generate")
 async def generate(request: ChatRequest):
-    try:
-        response = await process_message(request.message)
-        return JSONResponse(content={"response": response})
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)})
+   try:
+      return await process_message(request.message)
+   except Exception as e:
+      return JSONResponse(content={"error": str(e)})
+        
 
 @app.post("/generate_image")
 async def generate_image_endpoint(request: ImageRequest):
-    try:
-        image = await generate_image(request.prompt)
-        if image:
-            buffered = io.BytesIO()
-            image.save(buffered, format="PNG")
-            image_base64 = base64.b64encode(buffered.getvalue()).decode()
-
-            return JSONResponse(content={"image": image_base64})
-        else:
-            return JSONResponse(content={"error": "Image generation failed or no model loaded"})
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)})
-
+   try:
+       return await generate_image(request.prompt)
+   except Exception as e:
+       return JSONResponse(content={"error": str(e)})
 
 def run_uvicorn():
     try:
@@ -405,32 +497,7 @@ def run_uvicorn():
     except Exception as e:
         print(f"Error al ejecutar uvicorn: {e}")
 
-iface = gr.Interface(
-    fn=process_message,
-    inputs=gr.Textbox(lines=2, placeholder="Enter your message here..."),
-    outputs=gr.Markdown(),
-    title="Multi-Model LLM & Image API (CPU Optimized)",
-    description="Optimized version using GPU and memory management techniques."
-)
-iface_image = gr.Interface(
-    fn=generate_image,
-    inputs=gr.Textbox(lines=2, placeholder="Enter image prompt here..."),
-    outputs=gr.Image(),
-    title="Stable Diffusion Image Generator",
-    description="Generate images using the specified stable diffusion model."
-)
-
-
-def run_gradio():
-    with gr.Blocks(title="Multi-Model LLM & Image API (CPU Optimized)") as demo:
-        with gr.Tab("LLM"):
-            iface.render()
-        with gr.Tab("Image Generator"):
-            iface_image.render()
-    demo.launch(server_port=7862, prevent_thread_lock=True)
-
-
 if __name__ == "__main__":
     Thread(target=run_uvicorn).start()
-    Thread(target=run_gradio).start()
+    Thread(target=resource_manager, daemon=True).start()  # Run resource manager in background
     asyncio.get_event_loop().run_forever()
