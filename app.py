@@ -1,128 +1,436 @@
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
-from vllm import LLM
-from vllm.sampling_params import SamplingParams
-from huggingface_hub import hf_hub_download
-from datetime import datetime, timedelta
+import cachetools
+from pydantic import BaseModel
+from llama_cpp import Llama
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
+import gradio as gr
+import os
+from dotenv import load_dotenv
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+import uvicorn
+from threading import Thread
+import psutil
+import gc
+import torch
+import numpy as np
+from PIL import Image
+import stable_diffusion_cpp as sdcpp
+import base64
 import io
 
-# Configuración inicial
-model_name = "xfcxcxcdfdfd/1-bit"
-model_display_name = "Cyrah"  # Nombre automático del modelo
+load_dotenv()
+HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN")
+
+cache = cachetools.TTLCache(maxsize=100, ttl=60)
+
+global_data = {
+    'models': {},
+    'tokensxx': {
+        'eos': '<|end_of-text|>',
+        'pad': '<pad>',
+        'unk': '<unk>',
+        'bos': '<|begin_of_text|>',
+        'sep': '<|sep|>',
+        'cls': '<|cls|>',
+        'mask': '<mask>',
+        'eot': '<|eot_id|>',
+        'eom': '<|eom_id|>',
+        'lf': '<|0x0A|>'
+    },
+    'tokens': {
+        'eos': 'eos_token',
+        'pad': 'pad_token',
+        'unk': 'unk_token',
+        'bos': 'bos_token',
+        'sep': 'sep_token',
+        'cls': 'cls_token',
+        'mask': 'mask_token'
+    },
+    'model_metadata': {},
+    'eos': {},
+    'pad': {},
+    'padding': {},
+    'unk': {},
+    'bos': {},
+    'sep': {},
+    'cls': {},
+    'mask': {},
+    'eot': {},
+    'eom': {},
+    'lf': {},
+    'max_tokens': {},
+    'tokenizers': {},
+    'model_params': {},
+    'model_size': {},
+    'model_ftype': {},
+    'n_ctx_train': {},
+    'n_embd': {},
+    'n_layer': {},
+    'n_head': {},
+    'n_head_kv': {},
+    'n_rot': {},
+    'n_swa': {},
+    'n_embd_head_k': {},
+    'n_embd_head_v': {},
+    'n_gqa': {},
+    'n_embd_k_gqa': {},
+    'n_embd_v_gqa': {},
+    'f_norm_eps': {},
+    'f_norm_rms_eps': {},
+    'f_clamp_kqv': {},
+    'f_max_alibi_bias': {},
+    'f_logit_scale': {},
+    'n_ff': {},
+    'n_expert': {},
+    'n_expert_used': {},
+    'causal_attn': {},
+    'pooling_type': {},
+    'rope_type': {},
+    'rope_scaling': {},
+    'freq_base_train': {},
+    'freq_scale_train': {},
+    'n_ctx_orig_yarn': {},
+    'rope_finetuned': {},
+    'ssm_d_conv': {},
+    'ssm_d_inner': {},
+    'ssm_d_state': {},
+    'ssm_dt_rank': {},
+    'ssm_dt_b_c_rms': {},
+    'vocab_type': {},
+    'model_type': {},
+    "general.architecture": {},
+    "general.type": {},
+    "general.name": {},
+    "general.finetune": {},
+    "general.basename": {},
+    "general.size_label": {},
+    "general.license": {},
+    "general.license.link": {},
+    "general.tags": {},
+    "general.languages": {},
+    "general.organization": {},
+    "general.base_model.count": {},
+    'general.file_type': {},
+    "phi3.context_length": {},
+    "phi3.rope.scaling.original_context_length": {},
+    "phi3.embedding_length": {},
+    "phi3.feed_forward_length": {},
+    "phi3.block_count": {},
+    "phi3.attention.head_count": {},
+    "phi3.attention.head_count_kv": {},
+    "phi3.attention.layer_norm_rms_epsilon": {},
+    "phi3.rope.dimension_count": {},
+    "phi3.rope.freq_base": {},
+    "phi3.attention.sliding_window": {},
+    "phi3.rope.scaling.attn_factor": {},
+    "llama.block_count": {},
+    "llama.context_length": {},
+    "llama.embedding_length": {},
+    "llama.feed_forward_length": {},
+    "llama.attention.head_count": {},
+    "llama.attention.head_count_kv": {},
+    "llama.rope.freq_base": {},
+    "llama.attention.layer_norm_rms_epsilon": {},
+    "llama.attention.key_length": {},
+    "llama.attention.value_length": {},
+    "llama.vocab_size": {},
+    "llama.rope.dimension_count": {},
+    "deepseek2.block_count": {},
+    "deepseek2.context_length": {},
+    "deepseek2.embedding_length": {},
+    "deepseek2.feed_forward_length": {},
+    "deepseek2.attention.head_count": {},
+    "deepseek2.attention.head_count_kv": {},
+    "deepseek2.rope.freq_base": {},
+    "deepseek2.attention.layer_norm_rms_epsilon": {},
+    "deepseek2.expert_used_count": {},
+    "deepseek2.leading_dense_block_count": {},
+    "deepseek2.vocab_size": {},
+    "deepseek2.attention.kv_lora_rank": {},
+    "deepseek2.attention.key_length": {},
+    "deepseek2.attention.value_length": {},
+    "deepseek2.expert_feed_forward_length": {},
+    "deepseek2.expert_count": {},
+    "deepseek2.expert_shared_count": {},
+    "deepseek2.expert_weights_scale": {},
+    "deepseek2.rope.dimension_count": {},
+    "deepseek2.rope.scaling.type": {},
+    "deepseek2.rope.scaling.factor": {},
+    "deepseek2.rope.scaling.yarn_log_multiplier": {},
+    "qwen2.block_count": {},
+    "qwen2.context_length": {},
+    "qwen2.embedding_length": {},
+    "qwen2.feed_forward_length": {},
+    "qwen2.attention.head_count": {},
+    "qwen2.attention.head_count_kv": {},
+    "qwen2.rope.freq_base": {},
+    "qwen2.attention.layer_norm_rms_epsilon": {},
+    "general.version": {},
+    "general.datasets": {},
+    "tokenizer.ggml.model": {},
+    "tokenizer.ggml.pre": {},
+    "tokenizer.ggml.tokens": {},
+    "tokenizer.ggml.token_type": {},
+    "tokenizer.ggml.merges": {},
+    "tokenizer.ggml.bos_token_id": {},
+    "tokenizer.ggml.eos_token_id": {},
+    "tokenizer.ggml.unknown_token_id": {},
+    "tokenizer.ggml.padding_token_id": {},
+    "tokenizer.ggml.add_bos_token": {},
+    "tokenizer.ggml.add_eos_token": {},
+    "tokenizer.ggml.add_space_prefix": {},
+    "tokenizer.chat_template": {},
+    "quantize.imatrix.file": {},
+    "quantize.imatrix.dataset": {},
+    "quantize.imatrix.entries_count": {},
+    "quantize.imatrix.chunks_count": {},
+    "general.quantization_version": {},
+    'n_lora_q': {},
+    'n_lora_kv': {},
+    'n_expert_shared': {},
+    'n_ff_exp': {},
+    "n_layer_dense_lead": {},
+    "expert_weights_scale": {},
+    "rope_yarn_log_mul": {},
+    'eval': {},
+    'time': {},
+    'token': {},
+    'tokens': {},
+    'pads': {},
+    'model': {},
+    'base': {},
+    'model_base': {},
+    'perhaps': {},
+    'word': {},
+    'words': {},
+    'start': {},
+    'stop': {},
+    'run': {},
+    'runs': {},
+    'ms': {},
+    'vocabulary': {},
+    'timeout': {},
+    'load': {},
+    'load_time': {},
+    'bas': {},
+    'tok': {},
+    'second': {},
+    'seconds': {},
+    'graph': {},
+    'load_model': {},
+    'end': {},
+    'llama_perf_context_print': {},
+    'llm_load_print_meta': {},
+    'model_type': {},
+    'image_model': {}
+}
+
+
+model_configs = [
+    {
+        "repo_id": "Hjgugugjhuhjggg/testing_semifinal-Q2_K-GGUF",
+        "filename": "testing_semifinal-q2_k.gguf",
+        "name": "testing"
+    },
+    {
+        "repo_id": "bartowski/Llama-3.2-3B-Instruct-uncensored-GGUF",
+        "filename": "Llama-3.2-3B-Instruct-uncensored-Q2_K.gguf",
+        "name": "Llama-3.2-3B-Instruct"
+    },
+     {
+        "repo_id": "city96/FLUX.1-schnell-gguf",
+        "filename": "flux1-schnell-Q2_K.gguf",
+        "name": "flux1-schnell"
+     },
+    
+]
+
+class ModelManager:
+    def __init__(self):
+        self.models = {}
+        self.image_model = None
+
+    def load_model(self, model_config):
+        if model_config['name'] not in self.models and model_config['name'] != "flux1-schnell":
+           try:
+               self.models[model_config['name']] = Llama.from_pretrained(
+                  repo_id=model_config['repo_id'],
+                  filename=model_config['filename'],
+                  use_auth_token=HUGGINGFACE_TOKEN,
+                  n_threads=20,
+                  use_gpu=False
+               )
+           except Exception as e:
+              pass
+
+    def load_image_model(self, model_config):
+       try:
+          self.image_model = sdcpp.StableDiffusionCpp(
+              repo_id=model_config['repo_id'],
+              filename=model_config['filename'],
+              use_auth_token=HUGGINGFACE_TOKEN,
+              n_threads=20,
+              use_gpu=False
+          )
+       except Exception as e:
+         print(f"Error loading image model: {e}")
+
+    def load_all_models(self):
+        with ThreadPoolExecutor() as executor:
+            for config in model_configs:
+                if config['name'] == "flux1-schnell":
+                   executor.submit(self.load_image_model, config)
+                else:
+                    executor.submit(self.load_model, config)
+        return self.models, self.image_model
+
+
+model_manager = ModelManager()
+global_data['models'], global_data['image_model'] = model_manager.load_all_models()
+
+class ChatRequest(BaseModel):
+    message: str
+
+class ImageRequest(BaseModel):
+    prompt: str
+
+def normalize_input(input_text):
+    return input_text.strip()
+
+def remove_duplicates(text):
+    lines = text.split('\n')
+    unique_lines = []
+    seen_lines = set()
+    for line in lines:
+        if line not in seen_lines:
+            unique_lines.append(line)
+            seen_lines.add(line)
+    return '\n'.join(unique_lines)
+
+def cache_response(func):
+    def wrapper(*args, **kwargs):
+        cache_key = f"{args}-{kwargs}"
+        if cache_key in cache:
+            return cache[cache_key]
+        response = func(*args, **kwargs)
+        cache[cache_key] = response
+        return response
+    return wrapper
+
+
+@cache_response
+def generate_model_response(model, inputs):
+    try:
+        response = model(inputs, max_tokens=9999999)
+        return remove_duplicates(response['choices'][0]['text'])
+    except Exception as e:
+        return ""
+
+def remove_repetitive_responses(responses):
+    unique_responses = {}
+    for response in responses:
+        if response['model'] not in unique_responses:
+            unique_responses[response['model']] = response['response']
+    return unique_responses
+
+async def process_message(message):
+    inputs = normalize_input(message)
+    with ThreadPoolExecutor() as executor:
+        futures = [
+            executor.submit(generate_model_response, model, inputs)
+            for model in global_data['models'].values()
+        ]
+        responses = [
+            {'model': model_name, 'response': future.result()}
+            for model_name, future in zip(global_data['models'].keys(), as_completed(futures))
+        ]
+    unique_responses = remove_repetitive_responses(responses)
+    formatted_response = next(iter(unique_responses.values()))
+    return formatted_response
+
+async def generate_image(prompt: str):
+    if global_data['image_model']:
+        try:
+            image_bytes = global_data['image_model'].generate(
+                prompt=prompt,
+                negative_prompt="ugly, deformed, disfigured",
+                steps=25,
+                cfg_scale=7.0,
+                width=512,
+                height=512,
+                seed=-1,
+                return_type='bytes'
+             )
+             
+            image = Image.open(io.BytesIO(image_bytes))
+            return image
+        except Exception as e:
+           print(f"Error generating image: {e}")
+           return None
+    else:
+         print("No image model loaded.")
+         return None
+    
+
 app = FastAPI()
 
-# Función para generar el sistema de *prompt* de forma automática
-def generate_system_prompt(repo_id: str) -> str:
-    today = datetime.today().strftime('%Y-%m-%d')
-    yesterday = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
-    model_name = repo_id.split("/")[-1]
-    system_prompt = f"""
-    You are {model_display_name}, an AI trained to assist users.
-    Today's date is {today}, and yesterday was {yesterday}.
-    Your task is to provide helpful responses based on the user inputs.
-    If asked, you will respond with your name as "{model_display_name}".
-    """
-    return system_prompt
-
-# Inicialización del modelo con manejo de errores
-def initialize_model(model_name: str):
+@app.post("/generate")
+async def generate(request: ChatRequest):
     try:
-        # Intentar cargar el modelo con configuración llama3
-        model = LLM(
-            model=model_name,
-            config_format="llama3",
-            load_format="llama3",
-            tokenizer_mode="llama3",
-            tensor_parallel_size=8,
-            limit_mm_per_prompt={}
-        )
-        print("Modelo cargado con configuración llama3.")
+        response = await process_message(request.message)
+        return JSONResponse(content={"response": response})
     except Exception as e:
-        print(f"Error al cargar modelo con llama3: {e}. Cargando modelo con llama.")
-        # Si falla, cargar el modelo con configuración llama
-        model = LLM(
-            model=model_name,
-            config_format="llama",
-            load_format="llama",
-            tokenizer_mode="llama",
-            tensor_parallel_size=8,
-            limit_mm_per_prompt={}
-        )
-        print("Modelo cargado con configuración llama.")
-    
-    return model
+        return JSONResponse(content={"error": str(e)})
 
-# Cargar el modelo
-llm = initialize_model(model_name)
+@app.post("/generate_image")
+async def generate_image_endpoint(request: ImageRequest):
+    try:
+        image = await generate_image(request.prompt)
+        if image:
+            buffered = io.BytesIO()
+            image.save(buffered, format="PNG")
+            image_base64 = base64.b64encode(buffered.getvalue()).decode()
 
-sampling_params = SamplingParams(max_tokens=512)
-
-# Función para generar la respuesta, dividiendo en partes si excede los tokens
-def generate_long_response(messages, sampling_params):
-    full_response = ""
-    token_limit = sampling_params.max_tokens
-
-    # Bucle para manejar la división de respuestas
-    while True:
-        outputs = llm.chat(messages, sampling_params=sampling_params)
-        response_text = outputs[0].outputs[0].text
-        
-        # Concatenamos la respuesta
-        full_response += response_text
-
-        # Si la respuesta supera el límite de tokens, dividimos
-        if len(full_response.split()) > token_limit:
-            # Dividir la respuesta y continuar donde se quedó
-            messages[1]["content"] = response_text.split()[-token_limit:]
-            continue
+            return JSONResponse(content={"image": image_base64})
         else:
-            break
-
-    return full_response
-
-# Endpoint para recibir la pregunta como texto en el cuerpo de la solicitud y retornar en streaming
-@app.post("/generate/")
-async def generate_response(request: Request):
-    user_message = await request.body()
-    user_message = user_message.decode('utf-8')
-
-    # Generar el prompt del sistema automáticamente
-    system_prompt = generate_system_prompt(model_name)
-    
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message},
-    ]
-    
-    def generate_streaming_response(messages, sampling_params):
-        try:
-            full_response = ""
-            token_limit = sampling_params.max_tokens
-            while True:
-                outputs = llm.chat(messages, sampling_params=sampling_params)
-                response_text = outputs[0].outputs[0].text
-                
-                # Concatenamos la respuesta
-                full_response += response_text
-
-                # Si la respuesta supera el límite de tokens, dividimos y continuamos
-                yield response_text  # Aquí se manda la parte generada como un 'stream'
-                
-                if len(full_response.split()) > token_limit:
-                    # Dividir la respuesta y continuar donde se quedó
-                    messages[1]["content"] = response_text.split()[-token_limit:]
-                    continue
-                else:
-                    break
-
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
-
-    # Devolvemos la respuesta en streaming
-    return StreamingResponse(generate_streaming_response(messages, sampling_params), media_type="text/plain")
+            return JSONResponse(content={"error": "Image generation failed or no model loaded"})
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)})
 
 
-# Inicio del servidor con Uvicorn
+def run_uvicorn():
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=7860)
+    except Exception as e:
+        print(f"Error al ejecutar uvicorn: {e}")
+
+iface = gr.Interface(
+    fn=process_message,
+    inputs=gr.Textbox(lines=2, placeholder="Enter your message here..."),
+    outputs=gr.Markdown(),
+    title="Multi-Model LLM & Image API (CPU Optimized)",
+    description="Optimized version using GPU and memory management techniques."
+)
+iface_image = gr.Interface(
+    fn=generate_image,
+    inputs=gr.Textbox(lines=2, placeholder="Enter image prompt here..."),
+    outputs=gr.Image(),
+    title="Stable Diffusion Image Generator",
+    description="Generate images using the specified stable diffusion model."
+)
+
+
+def run_gradio():
+    with gr.Blocks(title="Multi-Model LLM & Image API (CPU Optimized)") as demo:
+        with gr.Tab("LLM"):
+            iface.render()
+        with gr.Tab("Image Generator"):
+            iface_image.render()
+    demo.launch(server_port=7862, prevent_thread_lock=True)
+
+
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    Thread(target=run_uvicorn).start()
+    Thread(target=run_gradio).start()
+    asyncio.get_event_loop().run_forever()
