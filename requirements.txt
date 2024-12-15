@@ -9,4 +9,4 @@ psutil
 torch
 numpy
 pillow
-stable-diffusion-cpp
+stable-diffusion-cpp-python
